@@ -1,0 +1,673 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template KVS License Detection Demo'
+
+Parameters:
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id'
+    Description: 'Ubuntu 22.04 LTS AMI from SSM Parameter Store'
+  EmailAddress:
+    Type: String
+    Description: Email address to receive notification when user-data script completes
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+
+Resources:
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: EC2UserDataCompletionTopic
+      KmsMasterKeyId: alias/aws/sns
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref EmailAddress
+
+  EC2KeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: aws-kvs-license-detection-key
+
+  KVSStream:
+    Type: AWS::KinesisVideo::Stream
+    Properties:
+      Name: aws-kvs-license-detection-demo
+      DataRetentionInHours: 24
+      Tags:
+        - Key: Name
+          Value: aws-kvs-license-detection-demo
+
+  S3LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub aws-kvs-license-detection-logs-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LambdaInvokePermission
+    Properties:
+      BucketName: !Sub aws-kvs-license-detection-s3-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3LoggingBucket
+        LogFilePrefix: access-logs/
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt LicensePlateDetectionFunction.Arn
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.medium
+      KeyName: !Ref EC2KeyPair
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      EbsOptimized: true
+      Monitoring: true
+      Tags:
+        - Key: Name
+          Value: aws-kvs-demo
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e  # Exit on error
+
+          # Update package lists and install dependencies in a single command
+          DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
+            cmake \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            libcurl4-openssl-dev \
+            liblog4cplus-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base-apps \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-tools \
+            git \
+            unzip \
+            jq
+
+          # Create working directory and set ownership
+          KVS_DIR="/home/ubuntu/amazon-kinesis-video-streams-producer-sdk-cpp"
+          mkdir -p $KVS_DIR
+          cd /home/ubuntu
+
+          # Clone and build KVS SDK
+          git clone https://github.com/awslabs/amazon-kinesis-video-streams-producer-sdk-cpp.git
+          cd $KVS_DIR
+          mkdir -p build && cd build
+          cmake .. -DBUILD_GSTREAMER_PLUGIN=ON -DBUILD_DEPENDENCIES=OFF -DALIGNED_MEMORY_MODEL=ON
+          make -j$(nproc)
+
+          # Set up environment
+          echo "export GST_PLUGIN_PATH=$KVS_DIR/build" >> /home/ubuntu/.bashrc
+          export GST_PLUGIN_PATH=$KVS_DIR/build
+
+          # Install AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          ./aws/install
+          rm -rf aws awscliv2.zip
+
+          # Create update-image-generation-input.json
+          cat > /home/ubuntu/update-image-generation-input.json << EOF
+          {
+            "StreamName": "aws-kvs-license-detection-demo",
+            "ImageGenerationConfiguration": {
+              "Status": "ENABLED",
+              "DestinationConfig": {
+                "DestinationRegion": "${AWS::Region}",
+                "Uri": "s3://aws-kvs-license-detection-s3-${AWS::AccountId}-${AWS::Region}"
+              },
+              "SamplingInterval": 2000,
+              "ImageSelectorType": "SERVER_TIMESTAMP",
+              "Format": "JPEG",
+              "FormatConfig": {
+                "JPEGQuality": "80"
+              },
+              "WidthPixels": 1280,
+              "HeightPixels": 720
+            }
+          }
+          EOF
+
+          # Update KVS image generation configuration
+          aws kinesisvideo update-image-generation-configuration \
+            --cli-input-json file:///home/ubuntu/update-image-generation-input.json
+
+          # Set up video streaming
+          VIDEO_DIR="/home/ubuntu/videos"
+          mkdir -p $VIDEO_DIR
+          cd $VIDEO_DIR
+          wget -q https://github.com/jpsotoal/aws-kvs-license-detection/raw/main/license-detection.mp4
+
+          # Create streaming script
+                    # Create streaming script with IMDSv2 support
+          cat > /home/ubuntu/stream-video.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          export GST_PLUGIN_PATH=/home/ubuntu/amazon-kinesis-video-streams-producer-sdk-cpp/build
+
+          # Get IMDSv2 token
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          if [ -z "$TOKEN" ]; then
+            echo "Failed to retrieve IMDSv2 token"
+            exit 1
+          fi
+
+          # Get credentials with IMDSv2 token
+          ROLE_NAME=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/iam/security-credentials/)
+          if [ -z "$ROLE_NAME" ]; then
+            echo "Failed to retrieve IAM role name"
+            exit 1
+          fi
+
+          CREDENTIALS=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/iam/security-credentials/$ROLE_NAME)
+          export AWS_ACCESS_KEY_ID=$(echo $CREDENTIALS | jq -r '.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo $CREDENTIALS | jq -r '.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo $CREDENTIALS | jq -r '.Token')
+          
+          # Get region using IMDSv2
+          export AWS_DEFAULT_REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ] || [ -z "$AWS_DEFAULT_REGION" ]; then
+            echo "Failed to retrieve credentials or region"
+            exit 1
+          fi
+
+          echo "Successfully retrieved credentials for role: $ROLE_NAME"
+          echo "Region: $AWS_DEFAULT_REGION"
+          
+          cd ~/amazon-kinesis-video-streams-producer-sdk-cpp/build
+          # ./kvs_gstreamer_sample aws-kvs-license-detection-demo ~/videos/license-detection.mp4
+          while true; do ./kvs_gstreamer_sample aws-kvs-license-detection-demo ~/videos/license-detection.mp4 && sleep 10s; done
+          EOF
+
+          # Set correct ownership and permissions
+          chown ubuntu:ubuntu /home/ubuntu/stream-video.sh
+          chmod +x /home/ubuntu/stream-video.sh
+
+          # Set correct ownership for all files in ubuntu's home directory
+          chown -R ubuntu:ubuntu /home/ubuntu/
+          
+          # Make videos directory and set permissions
+          mkdir -p /home/ubuntu/videos
+          chown -R ubuntu:ubuntu /home/ubuntu/videos
+          chmod 755 /home/ubuntu/videos
+
+          # Create systemd service to run stream-video.sh automatically
+          cat > /etc/systemd/system/kvs-stream.service << EOF
+          [Unit]
+          Description=KVS Video Streaming Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          WorkingDirectory=/home/ubuntu
+          ExecStart=/home/ubuntu/stream-video.sh
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # Enable and start the service
+          systemctl daemon-reload
+          systemctl enable kvs-stream.service
+          systemctl start kvs-stream.service
+
+          # Get IMDSv2 token first
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          if [ -z "$TOKEN" ]; then
+            echo "Failed to retrieve IMDSv2 token"
+            exit 1
+          fi
+
+          # Get instance ID using IMDSv2
+          INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "Failed to retrieve instance ID"
+            exit 1
+          fi
+
+          CONNECT_URL="https://${AWS::AccountId}.console.aws.amazon.com/ec2/home?region=${AWS::Region}#ConnectToInstance:instanceId=$INSTANCE_ID"
+
+          # Create a more detailed message
+          MESSAGE=$(cat <<EOF
+          EC2 instance $INSTANCE_ID has completed user-data script initialization.
+
+          Instance Details:
+          - Instance ID: $INSTANCE_ID
+          - Region: ${AWS::Region}
+          - Account ID: ${AWS::AccountId}
+
+          Connect to your instance using:
+          $CONNECT_URL
+
+          Note: Make sure you're logged into the AWS Console before using this URL.
+
+          The video streaming service has been automatically started and will run continuously.
+          
+          You can manage the streaming service using these commands:
+          - Check status: sudo systemctl status kvs-stream.service
+          - Stop streaming: sudo systemctl stop kvs-stream.service
+          - Start streaming: sudo systemctl start kvs-stream.service
+          - Restart streaming: sudo systemctl restart kvs-stream.service
+          - Disable auto-start: sudo systemctl disable kvs-stream.service
+          - Enable auto-start: sudo systemctl enable kvs-stream.service
+
+          EOF
+          )
+
+          # Send completion notification with the connect URL
+          aws sns publish \
+            --topic-arn ${NotificationTopic} \
+            --message "$MESSAGE" \
+            --subject "EC2 UserData Script Complete - Instance $INSTANCE_ID" \
+            --region ${AWS::Region}
+
+          # Log completion
+          echo "UserData script completed successfully and notification sent with connect URL"
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonKinesisVideoStreamsFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access via port 22
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+         
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonRekognitionFullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSDeadLetterQueuePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: LicensePlateDetectionDLQ
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  LicensePlateDetectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: LicensePlateDetectionFunction
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrentExecutions: 10
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          LICENSE_PLATE_TABLE: !Ref LicensePlateDetectionsTable
+          DUPLICATE_WINDOW_MINUTES: '5'
+          MIN_CONFIDENCE: '75.0'
+      Code:
+        ZipFile: |
+          import json
+          import urllib.parse
+          import boto3
+          import logging
+          import re
+          import os
+          import datetime
+          from decimal import Decimal
+          from botocore.exceptions import ClientError
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients (will be initialized in lambda_handler for actual use)
+          s3 = None
+          rekognition = None
+          dynamodb = None
+
+          def init_aws_clients():
+              """Initialize AWS clients"""
+              global s3, rekognition, dynamodb
+              if s3 is None:
+                  s3 = boto3.client('s3')
+                  rekognition = boto3.client('rekognition')
+                  dynamodb = boto3.resource('dynamodb')
+
+          # Configuration
+          TABLE_NAME = os.environ.get('LICENSE_PLATE_TABLE', 'LicensePlateDetections')
+          MIN_CONFIDENCE = 80.0  # Higher confidence for license plates
+          MIN_TEXT_SIZE = 3      # Minimum characters for license plate
+          MAX_TEXT_SIZE = 10     # Maximum characters for license plate
+
+          def is_license_plate_text(text, confidence):
+              """
+              Simple check if text looks like a license plate
+              Focus on big characters that are typically license plates
+              """
+              # Clean the text
+              clean_text = re.sub(r'[^A-Z0-9]', '', text.upper())
+              
+              # Basic validation
+              if confidence < MIN_CONFIDENCE:
+                  return False
+              
+              if len(clean_text) < MIN_TEXT_SIZE or len(clean_text) > MAX_TEXT_SIZE:
+                  return False
+              
+              # Filter out common non-license plate words
+              common_words = {'STOP', 'YIELD', 'EXIT', 'ENTER', 'PARKING', 'NO', 'YES', 'ONE', 'WAY'}
+              if clean_text in common_words:
+                  return False
+              
+              # Must contain both letters and numbers (typical license plate pattern)
+              has_letters = bool(re.search(r'[A-Z]', clean_text))
+              has_numbers = bool(re.search(r'[0-9]', clean_text))
+              
+              # License plates typically have both letters and numbers
+              if has_letters and has_numbers:
+                  return True
+              
+              # Or could be a state name (all letters, but longer than common words)
+              if has_letters and not has_numbers and len(clean_text) >= 5:
+                  # Known US states that could appear on license plates
+                  us_states = {'FLORIDA', 'TEXAS', 'CALIFORNIA', 'NEVADA', 'ARIZONA', 'OREGON', 'WASHINGTON', 'MONTANA', 'ALASKA', 'HAWAII'}
+                  if clean_text in us_states:
+                      return True
+              
+              return False
+
+          def extract_license_plates(image_bucket, image_key):
+              """
+              Extract license plate text from image using Rekognition
+              Focus on the biggest, most confident text detections
+              """
+              try:
+                  # Call Rekognition to detect text
+                  response = rekognition.detect_text(
+                      Image={
+                          'S3Object': {
+                              'Bucket': image_bucket,
+                              'Name': image_key
+                          }
+                      }
+                  )
+                  
+                  text_detections = response.get('TextDetections', [])
+                  logger.info(f"Found {len(text_detections)} text detections")
+                  
+                  license_plates = []
+                  
+                  # Process each text detection
+                  for detection in text_detections:
+                      detected_text = detection.get('DetectedText', '')
+                      confidence = detection.get('Confidence', 0)
+                      detection_type = detection.get('Type', '')
+                      
+                      # Focus on LINE detections (bigger text blocks) and high-confidence WORD detections
+                      if detection_type in ['LINE', 'WORD']:
+                          logger.info(f"Checking text: '{detected_text}' (confidence: {confidence:.1f}%, type: {detection_type})")
+                          
+                          if is_license_plate_text(detected_text, confidence):
+                              # Clean the text for storage
+                              clean_text = re.sub(r'[^A-Z0-9\s-]', '', detected_text.upper()).strip()
+                              
+                              license_plates.append({
+                                  'text': clean_text,
+                                  'confidence': confidence,
+                                  'original': detected_text,
+                                  'type': detection_type
+                              })
+                              
+                              logger.info(f"License plate found: '{clean_text}' (confidence: {confidence:.1f}%)")
+                  
+                  # Sort by confidence (highest first) and remove duplicates
+                  license_plates.sort(key=lambda x: x['confidence'], reverse=True)
+                  
+                  # Remove duplicates based on cleaned text
+                  unique_plates = []
+                  seen_texts = set()
+                  
+                  for plate in license_plates:
+                      clean_key = re.sub(r'[\s-]', '', plate['text'])
+                      if clean_key not in seen_texts:
+                          seen_texts.add(clean_key)
+                          unique_plates.append(plate)
+                  
+                  return unique_plates
+                  
+              except ClientError as e:
+                  logger.error(f"Error calling Rekognition: {e}")
+                  raise
+
+          def save_to_dynamodb(license_plate, confidence, image_key, bucket_name):
+              """
+              Save license plate detection to DynamoDB
+              """
+              try:
+                  table = dynamodb.Table(TABLE_NAME)
+                  
+                  # Create item
+                  item = {
+                      'image_name': image_key,  # Primary key
+                      'license_plate': license_plate,
+                      'confidence': Decimal(str(round(confidence, 2))),
+                      'bucket_name': bucket_name,
+                      'timestamp': datetime.datetime.now().isoformat()
+                  }
+                  
+                  # Save to DynamoDB
+                  table.put_item(Item=item)
+                  logger.info(f"Saved license plate '{license_plate}' to DynamoDB")
+                  return True
+                  
+              except ClientError as e:
+                  logger.error(f"Error saving to DynamoDB: {e}")
+                  return False
+
+          def lambda_handler(event, context):
+              """
+              Simple Lambda handler for license plate detection
+              """
+              try:
+                  # Initialize AWS clients
+                  init_aws_clients()
+                  
+                  # Get S3 event details
+                  record = event['Records'][0]
+                  bucket_name = record['s3']['bucket']['name']
+                  image_key = urllib.parse.unquote_plus(record['s3']['object']['key'], encoding='utf-8')
+                  
+                  logger.info(f"Processing image: {image_key} from bucket: {bucket_name}")
+                  
+                  # Extract license plates from image
+                  license_plates = extract_license_plates(bucket_name, image_key)
+                  
+                  if not license_plates:
+                      logger.info("No license plates detected")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': 'No license plates detected',
+                              'image_key': image_key
+                          })
+                      }
+                  
+                  # Process detected license plates
+                  results = []
+                  for plate in license_plates:
+                      # Save to DynamoDB
+                      saved = save_to_dynamodb(
+                          plate['text'], 
+                          plate['confidence'], 
+                          image_key, 
+                          bucket_name
+                      )
+                      
+                      results.append({
+                          'license_plate': plate['text'],
+                          'confidence': round(plate['confidence'], 2),
+                          'original_text': plate['original'],
+                          'detection_type': plate['type'],
+                          'saved_to_db': saved
+                      })
+                  
+                  logger.info(f"Successfully processed {len(results)} license plates")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Found {len(results)} license plates',
+                          'image_key': image_key,
+                          'license_plates': results
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing image: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'image_key': image_key if 'image_key' in locals() else 'unknown'
+                      })
+                  }
+
+  LicensePlateDetectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: LicensePlateDetections
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: image_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: image_name
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LicensePlateDetectionFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:s3:::aws-kvs-license-detection-s3-${AWS::AccountId}-${AWS::Region}
+
+Outputs:
+  InstanceId:
+    Description: Instance ID of the created EC2 instance
+    Value: !Ref EC2Instance
+  PublicDNS:
+    Description: Public DNS name of the created EC2 instance
+    Value: !GetAtt EC2Instance.PublicDnsName
+  PublicIP:
+    Description: Public IP address of the created EC2 instance
+    Value: !GetAtt EC2Instance.PublicIp
+  KeyPairName:
+    Description: Name of the created key pair
+    Value: !Ref EC2KeyPair
+  KVSStreamName:
+    Description: Name of the created KVS stream
+    Value: !Ref KVSStream
+  S3BucketName:
+    Description: Name of the created S3 bucket
+    Value: !Ref S3Bucket
+  LambdaFunctionName:
+    Description: Name of the Lambda function for license plate detection
+    Value: !Ref LicensePlateDetectionFunction
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table for license plate detections
+    Value: !Ref LicensePlateDetectionsTable
+  SNSTopicARN:
+    Description: ARN of the SNS Topic for notifications
+    Value: !Ref NotificationTopic
