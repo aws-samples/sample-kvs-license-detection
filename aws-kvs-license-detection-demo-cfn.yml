@@ -79,6 +79,8 @@ Resources:
           - Event: 's3:ObjectCreated:*'
             Function: !GetAtt LicensePlateDetectionFunction.Arn
 
+
+
   EC2Instance:
     Type: AWS::EC2::Instance
     Properties:
@@ -90,6 +92,10 @@ Resources:
       IamInstanceProfile: !Ref EC2InstanceProfile
       EbsOptimized: true
       Monitoring: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+        HttpEndpoint: enabled
       Tags:
         - Key: Name
           Value: aws-kvs-demo
@@ -311,10 +317,27 @@ Resources:
             Principal:
               Service: ec2.amazonaws.com
             Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonKinesisVideoStreamsFullAccess
-        - arn:aws:iam::aws:policy/AmazonS3FullAccess
       Policies:
+        - PolicyName: KVSSpecificAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesisvideo:PutMedia
+                  - kinesisvideo:UpdateImageGenerationConfiguration
+                  - kinesisvideo:DescribeStream
+                  - kinesisvideo:GetDataEndpoint
+                Resource: !GetAtt KVSStream.Arn
+        - PolicyName: S3SpecificAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub "arn:aws:s3:::aws-kvs-license-detection-s3-${AWS::AccountId}-${AWS::Region}/*"
         - PolicyName: SNSPublishPolicy
           PolicyDocument:
             Version: '2012-10-17'
@@ -351,11 +374,32 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonS3FullAccess
-        - arn:aws:iam::aws:policy/AmazonRekognitionFullAccess
-        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
+        - PolicyName: S3SpecificAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::aws-kvs-license-detection-s3-${AWS::AccountId}-${AWS::Region}/*"
+        - PolicyName: RekognitionSpecificAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectText
+                Resource: "*"
+        - PolicyName: DynamoDBSpecificAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt LicensePlateDetectionsTable.Arn
         - PolicyName: SQSDeadLetterQueuePolicy
           PolicyDocument:
             Version: '2012-10-17'

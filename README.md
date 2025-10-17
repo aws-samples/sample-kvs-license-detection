@@ -20,6 +20,14 @@ This project demonstrates an automated license plate detection system using AWS 
 - An AWS account with access to create the required resources
 - A valid email address to receive system notifications
 
+## Security Considerations
+
+The CloudFormation template (`aws-kvs-license-detection-demo-cfn.yml`) implements security best practices including:
+- **Least Privilege IAM**: Roles have minimal required permissions
+- **Resource-Specific Access**: Permissions scoped to specific resources only
+- **Encryption**: S3 and DynamoDB encryption enabled
+- **IMDSv2**: EC2 instance uses secure metadata service
+
 ## Deployment Instructions
 
 ### 1. Deploy the CloudFormation Stack
@@ -27,7 +35,7 @@ This project demonstrates an automated license plate detection system using AWS 
 ```bash
 aws cloudformation create-stack \
   --stack-name kvs-license-detection \
-  --template-body file://aws-kvs-license-detection-demo-cfn.yaml \
+  --template-body file://aws-kvs-license-detection-demo-cfn.yml \
   --parameters ParameterKey=EmailAddress,ParameterValue=your.email@example.com \
   --capabilities CAPABILITY_IAM
 ```
@@ -37,8 +45,6 @@ aws cloudformation create-stack \
 1. Check your email for a message from AWS Notifications
 2. Click the "Confirm subscription" link in the email
 3. You should see a confirmation message in your browser
-
-Here's the modified section with the added information about receiving the EC2 console login URL:
 
 ### 3. Wait for Setup Completion
 
@@ -56,7 +62,7 @@ Here's the modified section with the added information about receiving the EC2 c
 
 Example email content:
 
-```markdown
+```
 EC2 instance i-0123456789abcxxxx has completed user-data script initialization.
 
 Instance Details:
@@ -92,25 +98,22 @@ Only proceed with these steps after receiving the completion email:
 
 ### 1. Stream Video to KVS
 
-The EC2 instance, will run automatically script below:
+The EC2 instance automatically runs the streaming service:
 
 ```bash
-./stream-video.sh
-
-You can check streaming video in: AWS Console > Kinises Video Stream > Video streams > aws-kvs-license-detection-demo > Media playback.
+# The service runs automatically, but you can manage it with:
+sudo systemctl status kvs-stream.service
 ```
-**How to**: 
+
+**Service Management Commands**: 
 - Check status: `sudo systemctl status kvs-stream.service`
-
 - Stop streaming: `sudo systemctl stop kvs-stream.service`
-
 - Start streaming: `sudo systemctl start kvs-stream.service`
-
 - Restart streaming: `sudo systemctl restart kvs-stream.service`
-
 - Disable auto-start: `sudo systemctl disable kvs-stream.service`
-
 - Enable auto-start: `sudo systemctl enable kvs-stream.service`
+
+**View Streaming**: AWS Console > Kinesis Video Streams > Video streams > aws-kvs-license-detection-demo > Media playback
 
 ### 2. View Results
 
@@ -127,10 +130,19 @@ You can check streaming video in: AWS Console > Kinises Video Stream > Video str
 ## How It Works
 
 1. The EC2 instance streams video to Kinesis Video Stream
-2. KVS extracts image frames at 5-second intervals and saves them to S3
+2. KVS extracts image frames at 2-second intervals and saves them to S3
 3. S3 triggers the Lambda function when new images are uploaded
 4. Lambda uses Rekognition to detect license plates in the images
-5. If a license plate is detected with high confidence, the information is stored in DynamoDB
+5. If a license plate is detected with high confidence (≥80%), the information is stored in DynamoDB
+
+## Security Features
+
+The template implements:
+- **Least Privilege IAM**: Roles have minimal required permissions
+- **Resource-Specific Access**: Permissions scoped to specific resources only
+- **Encryption**: S3 and DynamoDB encryption enabled
+- **IMDSv2**: EC2 instance uses secure metadata service
+- **VPC Security**: Security groups restrict access appropriately
 
 ## Reporting Deployment
 Please refer to [KVS-Reporting-Deployment](https://github.com/jpsotoal/aws-kvs-license-detection/blob/main/reporting/README.md)
@@ -142,6 +154,8 @@ To delete all resources created by this stack:
 ```bash
 aws cloudformation delete-stack --stack-name kvs-license-detection
 ```
+
+**Note**: Ensure S3 buckets are empty before deletion, or add `--retain-resources` if needed.
 
 ## Troubleshooting
 
@@ -160,9 +174,15 @@ aws cloudformation delete-stack --stack-name kvs-license-detection
 
 To check EC2 instance logs:
 ```bash
-aws logs get-log-events \
-  --log-group-name /var/log/cloud-init-output.log \
-  --log-stream-name $(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+# Get instance ID first
+INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=aws-kvs-demo" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[0].Instances[0].InstanceId' --output text)
+
+# View logs
+aws logs describe-log-streams \
+  --log-group-name /aws/ec2/user-data \
+  --order-by LastEventTime --descending
 ```
 
 ## Support
@@ -172,3 +192,11 @@ If you encounter issues:
 2. Verify all SNS email confirmations were completed
 3. Ensure the user-data script completed successfully (check for completion email)
 4. Review IAM roles and permissions if experiencing access issues
+5. Review IAM roles and permissions if experiencing access issues
+
+## Cost Optimization
+
+- **EC2**: Consider using Spot instances for development
+- **KVS**: Data retention set to 24 hours to minimize costs
+- **DynamoDB**: Uses on-demand billing for cost efficiency
+- **Lambda**: Reserved concurrency limits prevent runaway costs
