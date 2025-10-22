@@ -169,7 +169,7 @@ Resources:
           VIDEO_DIR="/home/ubuntu/videos"
           mkdir -p $VIDEO_DIR
           cd $VIDEO_DIR
-          wget -q https://github.com/jpsotoal/aws-kvs-license-detection/raw/main/license-detection.mp4
+          wget -q https://github.com/aws-samples/sample-kvs-license-detection/raw/main/license-detection.mp4
 
           # Create streaming script
                     # Create streaming script with IMDSv2 support
@@ -332,12 +332,8 @@ Resources:
   InstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Enable SSH access via port 22
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 0.0.0.0/0
+      GroupDescription: Security group for KVS license detection EC2 instance
+      SecurityGroupIngress: []
          
 
   LambdaExecutionRole:
