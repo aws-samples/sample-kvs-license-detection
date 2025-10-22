@@ -87,12 +87,17 @@ aws cloudformation describe-stacks \
 
 Only proceed with these steps after receiving the completion email:
 
+**Option 1 (Recommended): Use the Session Manager URL from the completion email**
+- Click the provided URL directly (ensure you're logged into AWS Console first)
+
+**Option 2: Manual Session Manager Access**
 1. Open EC2 Console
 2. Look for the running instance named "aws-kvs-demo"
 3. Click on Connect button
-4. Select EC2 Instance Connect
-5. Leave the default settings
-6. Click Connect 
+4. Select **Session Manager** (NOT EC2 Instance Connect)
+5. Click Connect
+
+**Note**: This instance uses Session Manager for secure access. No SSH or inbound network access is configured (security best practice). 
 
 ## Testing the Solution
 
@@ -142,7 +147,8 @@ The template implements:
 - **Resource-Specific Access**: Permissions scoped to specific resources only
 - **Encryption**: S3 and DynamoDB encryption enabled
 - **IMDSv2**: EC2 instance uses secure metadata service
-- **VPC Security**: Security groups restrict access appropriately
+- **Zero Inbound Access**: Security group has no inbound rules (maximum security)
+- **Session Manager Access**: Secure, audited access without SSH exposure
 
 ## Reporting Deployment
 Please refer to [KVS-Reporting-Deployment](https://github.com/jpsotoal/aws-kvs-license-detection/blob/main/reporting/README.md)
@@ -165,7 +171,8 @@ aws cloudformation delete-stack --stack-name kvs-license-detection
 - **Long Setup Time**: The initialization process includes software installation and compilation, which can take 10-15 minutes
 
 ### Operation Phase
-- **EC2 Connection Issues**: Ensure your security group allows SSH access from your IP
+- **EC2 Connection Issues**: Use Session Manager via AWS Console. No SSH access is configured (security best practice with zero inbound rules)
+- **Session Manager Access**: Ensure you're logged into the AWS Console and have appropriate IAM permissions for Session Manager
 - **KVS Streaming Issues**: Check EC2 instance logs and ensure IAM permissions are correct
 - **Lambda Errors**: Check CloudWatch Logs for the Lambda function
 - **Missing License Plate Detections**: Ensure images contain clear, visible license plates for Rekognition to detect
